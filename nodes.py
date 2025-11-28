@@ -129,114 +129,115 @@ class MakeBatchFromIntList:
         int_tensor = torch.tensor(int_list, dtype=torch.int32)
 
         return (int_tensor,)
+    
+
+from decimal import Decimal, getcontext, ROUND_HALF_UP
+
+# 设置高精度（足够即可）
+getcontext().prec = 28
+
+def align_step_004(x: Decimal) -> Decimal:
+    """保证 x 是 0.04 的倍数，不丢精度"""
+    step = Decimal("0.04")
+    q = (x / step).to_integral_value(rounding=ROUND_HALF_UP)
+    return q * step
+
 
 class InfiniteTalkMultiImage():
-    """
-    ComfyUI 节点：
-    - 输入：audio_duration, fps, 最多20张图片及每张图片的 start_time
-    - 输出：images（按 start_time 排序），bigLoopFrames 列表，real_start_times（基于 bigLoopFrames 的实际开始时间，单位秒）
-    - 新增：text_list_input 文本框，按行切分并返回 text_list
-    """
 
     @classmethod
     def INPUT_TYPES(cls):
         inputs = {
             "required": {
-                "audio_duration": ("FLOAT", {"default": 8.0, "min": 0.01, "step": 0.001}),
+                "audio_duration": ("FLOAT", {"default": 8.0, "min": 0.01, "step": 0.04}),
                 "prompt_list_input": ("STRING", {"multiline": True, "default": ""}),
             },
             "optional": {}
         }
 
-        # 添加最多 20 张图片与 start_time
+        # 默认 start_time: 0, 3, 6, ... 但内部仍用 Decimal 处理
         for i in range(1, 21):
             inputs["optional"][f"image{i}"] = ("IMAGE",)
-            inputs["required"][f"start_time{i}"] = ("FLOAT", {"default": 0.0, "min": 0.0, "step": 0.001})
+            default_start = (i - 1) * 3.0
+            inputs["required"][f"start_time{i}"] = (
+                "FLOAT",
+                {"default": default_start, "min": 0.0, "step": 0.04}
+            )
 
         return inputs
 
     OUTPUT_IS_LIST = (True, True, True, True)
-    RETURN_TYPES = ("IMAGE", "INT", "FLOAT", "STRING",)  
+    RETURN_TYPES = ("IMAGE", "INT", "FLOAT", "STRING")
     RETURN_NAMES = ("image_list", "frame_count_list", "real_start_time_list", "prompt_list")
     FUNCTION = "calculate_big_loops"
     CATEGORY = "InfiniteTalk"
 
     @staticmethod
     def calculate_big_loops(**kwargs):
-        fps = 25
-        audio_duration = float(kwargs.get("audio_duration", 0.0))
-        total_frames = int(round(audio_duration * fps))
+        fps = Decimal("25")
+        step = Decimal("0.04")
 
+        # =============== 音频长度 Decimal 无损读取 ===============
+        audio_duration = Decimal(str(kwargs.get("audio_duration", "0")))
+        audio_duration = align_step_004(audio_duration)
+
+        # =============== 文本 ===============
         raw_text = kwargs.get("prompt_list_input", "")
-        # 按行 split，去掉空行
         text_list = [line.strip() for line in raw_text.split("\n") if line.strip()]
 
-        # ================= 收集图片与 start time =================
+        # =============== 图片 + start_time ===============
         pairs = []
+
         for i in range(1, 21):
             img = kwargs.get(f"image{i}", None)
-            st = kwargs.get(f"start_time{i}", None)
+            raw_st = kwargs.get(f"start_time{i}", None)
+
             if img is not None:
-                st_val = float(st) if st is not None else 0.0
-                pairs.append((st_val, img))
+                st = Decimal(str(raw_st))
+                st = align_step_004(st)  # 强制对齐到 0.04
+                pairs.append((st, img))
 
         if not pairs:
             return [], [], [], text_list
 
-        # 按 start_time 排序
+        # 排序
         pairs.sort(key=lambda x: x[0])
-        input_start_times = [p[0] for p in pairs]
+        start_times = [p[0] for p in pairs]  # Decimal
         images = [p[1] for p in pairs]
 
-        # 计算每段 framesNeeded
-        frames_needed = []
-        for idx, st in enumerate(input_start_times):
-            end_t = input_start_times[idx + 1] if idx < len(input_start_times) - 1 else audio_duration
-            dur = max(0.0, end_t - st)
-            fn = int(round(dur * fps))
-            frames_needed.append(fn)
+        # =============== frame count（真实差值） ===============
+        frame_count_list = []
 
-        # bigLoopFrames 规则：81 + 72*n >= frames_needed
-        big_loop_frames = []
-        for fn in frames_needed:
-            if fn <= 81:
-                cap = 81
+        for idx, st in enumerate(start_times):
+            if idx < len(start_times) - 1:
+                end = start_times[idx + 1]
             else:
-                n = -(-(fn - 81) // 72)
-                cap = 81 + 72 * n
-            big_loop_frames.append(cap)
+                end = audio_duration
 
-        # 若总帧数超过音频长度，压缩最后一个
-        s = sum(big_loop_frames)
-        if s > total_frames:
-            allowed_last = total_frames - sum(big_loop_frames[:-1])
-            big_loop_frames[-1] = max(1, allowed_last)
+            dur = end - st
+            if dur < 0:
+                dur = Decimal("0")
 
-        # 计算真实开始帧
-        real_start_frames = []
-        cur = 0
-        for cap in big_loop_frames:
-            real_start_frames.append(cur)
-            cur += cap
+            frames = int(dur * fps)  # Decimal → int 无损
+            frame_count_list.append(frames)
 
-        # 转为秒
-        real_start_times = [f / fps for f in real_start_frames]
-        real_start_times.append(audio_duration)
+        # =============== real_start_time_list ===============
+        real_start_time_list = [float(t) for t in start_times]
 
-        # ================= 对齐 text_list =================
+        # =============== prompt 对齐 ===============
         n_images = len(images)
         n_texts = len(text_list)
+
         if n_texts < n_images:
-            # 不够用最后一行补齐
             if text_list:
                 text_list.extend([text_list[-1]] * (n_images - n_texts))
             else:
                 text_list = [""] * n_images
         elif n_texts > n_images:
-            # 多余的截断
             text_list = text_list[:n_images]
 
-        return images, big_loop_frames, real_start_times, text_list
+        return images, frame_count_list, real_start_time_list, text_list
+
 
 
 
