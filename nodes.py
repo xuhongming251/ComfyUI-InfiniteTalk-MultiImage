@@ -1253,7 +1253,8 @@ class VideoFromPathsAndAudio:
             "-r", str(fps),
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
-            "-c:a", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
             "-shortest",
             output_file_path
         ]
