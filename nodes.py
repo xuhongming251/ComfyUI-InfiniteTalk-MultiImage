@@ -1,13 +1,25 @@
 
-
 import torchaudio
 import torch
-import numpy as np
-from tqdm import tqdm
-import webrtcvad
-from comfy.utils import common_upscale
-import datetime
+import os
+import glob
+import subprocess
+import shutil
+import tempfile
+import random
+from PIL import Image, ImageDraw, ImageFilter
+import folder_paths
 
+from decimal import Decimal, getcontext, ROUND_HALF_UP
+
+# 设置高精度（足够即可）
+getcontext().prec = 28
+
+def align_step_004(x: Decimal) -> Decimal:
+    """保证 x 是 0.04 的倍数，不丢精度"""
+    step = Decimal("0.04")
+    q = (x / step).to_integral_value(rounding=ROUND_HALF_UP)
+    return q * step
 
 class GetFloatByIndex:
     @classmethod
@@ -124,19 +136,6 @@ class MakeBatchFromIntList:
         int_tensor = torch.tensor(int_list, dtype=torch.int32)
 
         return (int_tensor,)
-    
-
-from decimal import Decimal, getcontext, ROUND_HALF_UP
-
-# 设置高精度（足够即可）
-getcontext().prec = 28
-
-def align_step_004(x: Decimal) -> Decimal:
-    """保证 x 是 0.04 的倍数，不丢精度"""
-    step = Decimal("0.04")
-    q = (x / step).to_integral_value(rounding=ROUND_HALF_UP)
-    return q * step
-
 
 class InfiniteTalkMultiImage():
 
@@ -171,7 +170,7 @@ class InfiniteTalkMultiImage():
 
     @staticmethod
     def calculate_big_loops(**kwargs):
-        fps = Decimal("25")
+        fps = Decimal("25") 
         
         auto_start_time_list = kwargs.get("auto_start_time_list", [])
 
@@ -295,14 +294,9 @@ class InfiniteTalkEmbedsSlice:
     def slice(self, multitalk_embeds, start_video_frame, video_frame_length, fps):
         """
         将视频帧区间转换为音频 embedding 帧区间：
-        腾讯 wav2vec2 每秒 50 帧 → audio_fps = 50
-        所以：
-            audio_frame = int(video_frame * audio_fps / fps)
-                         = int(video_frame * (50 / fps))
-        fps 默认=25 → 每个视频帧 = 2 音频帧
         """
 
-        # MultiTalk wav2vec2 输出固定 50 帧/秒
+        # MultiTalk wav2vec2 输出固定 25 帧/秒
         AUDIO_FPS = 25
         
 
@@ -337,262 +331,6 @@ class InfiniteTalkEmbedsSlice:
 
         return (sliced_embeds,)
 
-
-
-
-# # --- 加载 Silero VAD ---
-# vad_model, utils = torch.hub.load(
-#     repo_or_dir='snakers4/silero-vad',
-#     model='silero_vad',
-#     force_reload=False,
-#     onnx=False,
-# )
-
-# (get_speech_timestamps,
-#  save_audio,
-#  read_audio,
-#  VADIterator,
-#  collect_chunks) = utils
-
-
-# # ================================================================
-# #                      ComfyUI 节点定义
-# # ================================================================
-# class AudioVADNode:
-#     """
-#     使用 Silero VAD 检测音频中的人声段落
-#     输出：
-#         - segments：数组，每项为 {"start": 秒, "end": 秒, "duration": 秒}
-#         - label_txt：一个 txt 文件路径，包含所有人声起止点
-#     """
-
-#     @classmethod
-#     def INPUT_TYPES(cls):
-#         return {
-#             "required": {
-#                 "audio_path": ("STRING", {"default": "", "multiline": False}),
-#             }
-#         }
-
-#     RETURN_TYPES = ("DICT", "STRING")
-#     RETURN_NAMES = ("segments", "label_file")
-#     FUNCTION = "run"
-#     CATEGORY = "Audio/Analysis"
-
-#     def run(self, audio_path):
-#         if not os.path.exists(audio_path):
-#             raise Exception(f"Audio file not found: {audio_path}")
-
-#         # --- 读取音频 ---
-#         wav = read_audio(audio_path)
-#         sr = 16000
-
-#         # --- VAD 检测 ---
-#         timestamps = get_speech_timestamps(wav, vad_model, sampling_rate=sr)
-
-#         segments = []
-#         for ts in timestamps:
-#             start = ts['start'] / sr
-#             end = ts['end'] / sr
-#             duration = end - start
-#             segments.append({
-#                 "start": round(start, 3),
-#                 "end": round(end, 3),
-#                 "duration": round(duration, 3)
-#             })
-
-#         # --- 输出 label 文件 ---
-#         output_dir = Path(os.getcwd()) / "vad_output"
-#         output_dir.mkdir(exist_ok=True)
-
-#         label_file = output_dir / f"vad_segments.txt"
-#         with open(label_file, "w", encoding="utf-8") as f:
-#             for i, seg in enumerate(segments):
-#                 f.write(f"{seg['start']}\t{seg['end']}\tsegment_{i+1}\n")
-
-#         return segments, str(label_file)
-
-
-
-class AudioSmartSlice:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "audio": ("AUDIO", ),
-                "min_sec": ("FLOAT", {"default": 10.0, "min": 1.0}),
-                "max_sec": ("FLOAT", {"default": 12.0, "min": 1.0}),
-                "vad_aggressiveness": ("INT", {"default": 2, "min": 0, "max": 3}),
-                "frame_ms": ("INT", {"default": 30, "min": 10, "max": 50}),
-            }
-        }
-
-    RETURN_TYPES = ("FLOAT", "FLOAT")
-    RETURN_NAMES = ("chunk_start_times", "chunk_durations")
-    OUTPUT_IS_LIST = (True, True)
-    FUNCTION = "run"
-    CATEGORY = "audio/slicing"
-
-    def run(self, audio, min_sec, max_sec, vad_aggressiveness, frame_ms):
-        waveform = audio["waveform"]
-        sample_rate = audio["sample_rate"]
-
-        # ----------------------------
-        # 1) 兼容官方 AUDIO shape
-        # ----------------------------
-        wf = waveform
-        if wf.ndim == 3:  # (1, C, T)
-            wf = wf.mean(dim=1)
-        if wf.ndim == 2:  # (1, T)
-            wf = wf.squeeze(0)
-
-        # 必须重采样到 16000Hz 才能用于 webrtcvad
-        if sample_rate != 16000:
-            wf = torchaudio.functional.resample(wf, orig_freq=sample_rate, new_freq=16000)
-            sample_rate = 16000
-
-        wf_np = wf.detach().cpu().numpy()
-        total_samples = len(wf_np)
-
-        # ----------------------------
-        # 2) webrtcvad 需要 16-bit PCM
-        # ----------------------------
-        wf_int16 = np.int16(np.clip(wf_np * 32768, -32768, 32767))
-
-        # ----------------------------
-        # 3) 分帧
-        # ----------------------------
-        frame_bytes = int(sample_rate * frame_ms / 1000)
-        frames = []
-        for start in range(0, total_samples, frame_bytes):
-            end = min(start + frame_bytes, total_samples)
-            chunk = wf_int16[start:end]
-            # 补齐最后一帧
-            if len(chunk) < frame_bytes:
-                chunk = np.pad(chunk, (0, frame_bytes - len(chunk)), mode='constant')
-            frames.append(chunk.tobytes())
-
-        # ----------------------------
-        # 4) VAD 检测人声
-        # ----------------------------
-        vad = webrtcvad.Vad(vad_aggressiveness)
-        voiced_flags = [vad.is_speech(f, sample_rate) for f in frames]
-
-        # ----------------------------
-        # 5) 找静音段 (sample indices)
-        # ----------------------------
-        silent_segments = []
-        start_frame = None
-        for i, flag in enumerate(voiced_flags):
-            if not flag and start_frame is None:
-                start_frame = i
-            elif flag and start_frame is not None:
-                silent_segments.append((start_frame, i))
-                start_frame = None
-        if start_frame is not None:
-            silent_segments.append((start_frame, len(voiced_flags)))
-
-        # 转换成样本位置 (start_sample, end_sample)
-        silent = [(s[0] * frame_bytes, s[1] * frame_bytes) for s in silent_segments]
-
-        # ----------------------------
-        # 6) 切片逻辑 (修复版)
-        # ----------------------------
-        target_min = int(min_sec * sample_rate)
-        target_max = int(max_sec * sample_rate)
-
-        chunks_start_sec = []
-        chunks_dur_sec = []
-
-        pos = 0
-        pbar = tqdm(total=total_samples, desc="Processing chunks", unit="samples")
-        
-        while pos < total_samples:
-            # 这里的逻辑是：必须切在 [pos + min, pos + max] 之间
-            min_cut_point = pos + target_min
-            max_cut_point = pos + target_max
-            
-            # 如果最小切点已经超过总长度，直接把剩下的包圆了
-            if min_cut_point >= total_samples:
-                chunks_start_sec.append(pos / sample_rate)
-                chunks_dur_sec.append((total_samples - pos) / sample_rate)
-                pbar.update(total_samples - pos)
-                break
-
-            # 默认强制在 max 处切断 (Hard Cut)
-            actual_cut_point = min(max_cut_point, total_samples)
-
-            # 尝试在 [min_cut_point, max_cut_point] 范围内寻找静音点
-            found_silence = False
-            
-            for s_start, s_end in silent:
-                # 优化：如果静音段完全在当前窗口之前，跳过
-                if s_end < min_cut_point:
-                    continue
-                # 优化：如果静音段开始得太晚（超过了最大限制），后面的都不用看了
-                if s_start > actual_cut_point:
-                    break
-
-                # 情况 A: 刚好有一段静音涵盖了 min_cut_point
-                # 此时我们可以在 min_cut_point 处安全切断（因为那里是静音）
-                if s_start <= min_cut_point <= s_end:
-                    actual_cut_point = min_cut_point
-                    found_silence = True
-                    break
-
-                # 情况 B: 有一段静音的开头落在了 [min, max] 区间内
-                if min_cut_point <= s_start <= actual_cut_point:
-                    actual_cut_point = s_start
-                    found_silence = True
-                    break 
-
-            # 记录分段
-            duration = actual_cut_point - pos
-            chunks_start_sec.append(pos / sample_rate)
-            chunks_dur_sec.append(duration / sample_rate)
-            
-            pbar.update(duration)
-            
-            # 更新 pos
-            # 这里保证了 actual_cut_point >= pos + target_min (除非到了文件末尾)
-            # 所以绝对不会死循环
-            pos = actual_cut_point
-
-        pbar.close()
-
-        return (chunks_start_sec, chunks_dur_sec)
-    
-
-
-import os
-import glob
-import subprocess
-import shutil
-import tempfile
-import torch
-import torchaudio
-from PIL import Image
-import numpy as np
-
-import folder_paths
-# ========== 全部必要 imports ==========
-import os
-import glob
-import shutil
-import subprocess
-import tempfile
-import random
-import math
-
-import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageChops, ImageEnhance
-
-import torch
-import torchaudio
-
-import folder_paths
-
-# ========== VideoFromPathsAndAudio 节点（完整） ==========
 class VideoFromPathsAndAudio:
     def __init__(self):
         pass
@@ -1281,310 +1019,26 @@ class VideoFromPathsAndAudio:
         return (output_file_path,)
     
 
-
-class WanVideoImageToVideoInfiniteTalkFunCamera:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-            "vae": ("WANVAE",),
-            "width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8, "tooltip": "Width of the generation"}),
-            "height": ("INT", {"default": 480, "min": 64, "max": 29048, "step": 8, "tooltip": "Height of the generation"}),
-            "frame_window_size": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "The number of frames to process at once, should be a value the model is generally good at."}),
-            "motion_frame": ("INT", {"default": 25, "min": 1, "max": 10000, "step": 1, "tooltip": "Driven frame length used in the long video generation. Basically the overlap length."}),
-            "force_offload": ("BOOLEAN", {"default": False, "tooltip": "Whether to force offload the model within the loop for VAE operations, enable if you encounter memory issues."}),
-            "colormatch": (
-            [   
-                'disabled',
-                'mkl',
-                'hm', 
-                'reinhard', 
-                'mvgd', 
-                'hm-mvgd-hm', 
-                'hm-mkl-hm',
-            ], {
-               "default": 'disabled', "tooltip": "Color matching method to use between the windows"
-            },),
-            },
-            "optional": {
-                "start_image": ("IMAGE", {"tooltip": "Images to encode"}),
-                "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
-                "clip_embeds": ("WANVIDIMAGE_CLIPEMBEDS", {"tooltip": "Clip vision encoded image"}),
-                "control_embeds": ("WANVIDIMAGE_EMBEDS", {"tooltip": "Control signal for the Fun -model"}),
-                "fun_or_fl2v_model": ("BOOLEAN", {"default": True, "tooltip": "Enable when using official FLF2V or Fun model"}),
-                "mode": ([
-                    "auto",
-                    "multitalk",
-                    "infinitetalk"
-                ], {"default": "auto", "tooltip": "The sampling strategy to use in the long video generation loop, should match the model used"}),
-                "output_path": ("STRING", {"default": "", "tooltip": "If set, will save each window's resulting frames to this folder, also DISABLES returning the final video tensor to save memory"}),
-
-            }
-        }
-
-    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS", "STRING",)
-    RETURN_NAMES = ("image_embeds", "output_path")
-    FUNCTION = "process"
-    CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Enables Multi/InfiniteTalk long video generation sampling method, the video is created in windows with overlapping frames. Not compatible or necessary to be used with context windows and many other features besides Multi/InfiniteTalk."
-
-    def process(self, vae, width, height, frame_window_size, motion_frame, force_offload, colormatch, start_image=None, tiled_vae=False, clip_embeds=None, control_embeds = None, fun_or_fl2v_model=False, mode="multitalk", output_path=""):
-
-        H = height
-        W = width
-        VAE_STRIDE = (4, 8, 8)
-        
-        num_frames = ((frame_window_size - 1) // 4) * 4 + 1
-
-        # Resize and rearrange the input image dimensions
-        if start_image is not None:
-            resized_start_image = common_upscale(start_image.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(0, 1)
-            resized_start_image = resized_start_image * 2 - 1
-            resized_start_image = resized_start_image.unsqueeze(0)
-        
-        target_shape = (16, (num_frames - 1) // VAE_STRIDE[0] + 1,
-                        height // VAE_STRIDE[1],
-                        width // VAE_STRIDE[2])
-        
-        if output_path:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = os.path.join(output_path, f"{timestamp}_{mode}_output")
-            os.makedirs(output_path, exist_ok=True)
-
-        image_embeds = {
-            "multitalk_sampling": True,
-            "multitalk_start_image": resized_start_image if start_image is not None else None,
-            "frame_window_size": num_frames,
-            "motion_frame": motion_frame,
-            "target_h": H,
-            "target_w": W,
-            "lat_h": H,
-            "lat_w": W,
-            "control_embeds": control_embeds["control_embeds"] if control_embeds is not None else None,
-            "tiled_vae": tiled_vae,
-            "force_offload": force_offload,
-            "fun_or_fl2v_model": fun_or_fl2v_model,
-            "vae": vae,
-            "target_shape": target_shape,
-            "clip_context": clip_embeds.get("clip_embeds", None) if clip_embeds is not None else None,
-            "colormatch": colormatch,
-            "multitalk_mode": mode,
-            "output_path": output_path
-        }
-
-        return (image_embeds, output_path)
-    
-
-from comfy import model_management as mm
-import os, gc, math
-from .utils import(log, clip_encode_image_tiled, add_noise_to_reference_video, set_module_tensor_to_device)
-
-VAE_STRIDE = (4, 8, 8)
-PATCH_SIZE = (1, 2, 2)
-
-device = mm.get_torch_device()
-offload_device = mm.unet_offload_device()
-
-class WanVideoImageToVideoEncodeForInfiniteTalkFunCamera:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-            "width": ("INT", {"default": 832, "min": 64, "max": 8096, "step": 8, "tooltip": "Width of the image to encode"}),
-            "height": ("INT", {"default": 480, "min": 64, "max": 8096, "step": 8, "tooltip": "Height of the image to encode"}),
-            "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to encode"}),
-            "noise_aug_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Strength of noise augmentation, helpful for I2V where some noise can add motion and give sharper results"}),
-            "start_latent_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional latent multiplier, helpful for I2V where lower values allow for more motion"}),
-            "end_latent_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional latent multiplier, helpful for I2V where lower values allow for more motion"}),
-            "force_offload": ("BOOLEAN", {"default": True}),
-            },
-            "optional": {
-                "vae": ("WANVAE",),
-                "clip_embeds": ("WANVIDIMAGE_CLIPEMBEDS", {"tooltip": "Clip vision encoded image"}),
-                "start_image": ("IMAGE", {"tooltip": "Image to encode"}),
-                "end_image": ("IMAGE", {"tooltip": "end frame"}),
-                "control_embeds": ("WANVIDIMAGE_EMBEDS", {"tooltip": "Control signal for the Fun -model"}),
-                "fun_or_fl2v_model": ("BOOLEAN", {"default": True, "tooltip": "Enable when using official FLF2V or Fun model"}),
-                "temporal_mask": ("MASK", {"tooltip": "mask"}),
-                "extra_latents": ("LATENT", {"tooltip": "Extra latents to add to the input front, used for Skyreels A2 reference images"}),
-                "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
-                "add_cond_latents": ("ADD_COND_LATENTS", {"advanced": True, "tooltip": "Additional cond latents WIP"}),
-                "output_path": ("STRING", {"default": "", "tooltip": "If set, will save each window's resulting frames to this folder, also DISABLES returning the final video tensor to save memory"}),
-            }
-        }
-
-    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
-    RETURN_NAMES = ("image_embeds",)
-    FUNCTION = "process"
-    CATEGORY = "WanVideoWrapper"
-
-    def process(self, width, height, num_frames, force_offload, noise_aug_strength, 
-                start_latent_strength, end_latent_strength, start_image=None, end_image=None, control_embeds=None, fun_or_fl2v_model=False, 
-                temporal_mask=None, extra_latents=None, clip_embeds=None, tiled_vae=False, add_cond_latents=None, vae=None, output_path=""):
-        
-        if vae is None:
-            raise ValueError("VAE is required for image encoding.")
-        H = height
-        W = width
-           
-        lat_h = H // vae.upsampling_factor
-        lat_w = W // vae.upsampling_factor
-
-        num_frames = ((num_frames - 1) // 4) * 4 + 1
-        two_ref_images = start_image is not None and end_image is not None
-
-        if start_image is None and end_image is not None:
-            fun_or_fl2v_model = True # end image alone only works with this option
-
-        base_frames = num_frames + (1 if two_ref_images and not fun_or_fl2v_model else 0)
-        if temporal_mask is None:
-            mask = torch.zeros(1, base_frames, lat_h, lat_w, device=device, dtype=vae.dtype)
-            if start_image is not None:
-                mask[:, 0:start_image.shape[0]] = 1  # First frame
-            if end_image is not None:
-                mask[:, -end_image.shape[0]:] = 1  # End frame if exists
-        else:
-            mask = common_upscale(temporal_mask.unsqueeze(1).to(device), lat_w, lat_h, "nearest", "disabled").squeeze(1)
-            if mask.shape[0] > base_frames:
-                mask = mask[:base_frames]
-            elif mask.shape[0] < base_frames:
-                mask = torch.cat([mask, torch.zeros(base_frames - mask.shape[0], lat_h, lat_w, device=device)])
-            mask = mask.unsqueeze(0).to(device, vae.dtype)
-
-        # Repeat first frame and optionally end frame
-        start_mask_repeated = torch.repeat_interleave(mask[:, 0:1], repeats=4, dim=1) # T, C, H, W
-        if end_image is not None and not fun_or_fl2v_model:
-            end_mask_repeated = torch.repeat_interleave(mask[:, -1:], repeats=4, dim=1) # T, C, H, W
-            mask = torch.cat([start_mask_repeated, mask[:, 1:-1], end_mask_repeated], dim=1)
-        else:
-            mask = torch.cat([start_mask_repeated, mask[:, 1:]], dim=1)
-
-        # Reshape mask into groups of 4 frames
-        mask = mask.view(1, mask.shape[1] // 4, 4, lat_h, lat_w) # 1, T, C, H, W
-        mask = mask.movedim(1, 2)[0]# C, T, H, W
-
-        # Resize and rearrange the input image dimensions
-        if start_image is not None:
-            start_image = start_image[..., :3]
-            if start_image.shape[1] != H or start_image.shape[2] != W:
-                resized_start_image = common_upscale(start_image.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(0, 1)
-            else:
-                resized_start_image = start_image.permute(3, 0, 1, 2) # C, T, H, W
-            resized_start_image = resized_start_image * 2 - 1
-            if noise_aug_strength > 0.0:
-                resized_start_image = add_noise_to_reference_video(resized_start_image, ratio=noise_aug_strength)
-        
-        if end_image is not None:
-            end_image = end_image[..., :3]
-            if end_image.shape[1] != H or end_image.shape[2] != W:
-                resized_end_image = common_upscale(end_image.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(0, 1)
-            else:
-                resized_end_image = end_image.permute(3, 0, 1, 2) # C, T, H, W
-            resized_end_image = resized_end_image * 2 - 1
-            if noise_aug_strength > 0.0:
-                resized_end_image = add_noise_to_reference_video(resized_end_image, ratio=noise_aug_strength)
-            
-        # Concatenate image with zero frames and encode
-        if temporal_mask is None:
-            if start_image is not None and end_image is None:
-                zero_frames = torch.zeros(3, num_frames-start_image.shape[0], H, W, device=device, dtype=vae.dtype)
-                concatenated = torch.cat([resized_start_image.to(device, dtype=vae.dtype), zero_frames], dim=1)
-                del resized_start_image, zero_frames
-            elif start_image is None and end_image is not None:
-                zero_frames = torch.zeros(3, num_frames-end_image.shape[0], H, W, device=device, dtype=vae.dtype)
-                concatenated = torch.cat([zero_frames, resized_end_image.to(device, dtype=vae.dtype)], dim=1)
-                del zero_frames
-            elif start_image is None and end_image is None:
-                concatenated = torch.zeros(3, num_frames, H, W, device=device, dtype=vae.dtype)
-            else:
-                if fun_or_fl2v_model:
-                    zero_frames = torch.zeros(3, num_frames-(start_image.shape[0]+end_image.shape[0]), H, W, device=device, dtype=vae.dtype)
-                else:
-                    zero_frames = torch.zeros(3, num_frames-1, H, W, device=device, dtype=vae.dtype)
-                concatenated = torch.cat([resized_start_image.to(device, dtype=vae.dtype), zero_frames, resized_end_image.to(device, dtype=vae.dtype)], dim=1)
-                del resized_start_image, zero_frames
-        else:
-            temporal_mask = common_upscale(temporal_mask.unsqueeze(1), W, H, "nearest", "disabled").squeeze(1)
-            concatenated = resized_start_image[:,:num_frames].to(vae.dtype)# * temporal_mask[:num_frames].unsqueeze(0).to(vae.dtype)
-            del resized_start_image, temporal_mask
-
-        mm.soft_empty_cache()
-        gc.collect()
-
-        vae.to(device)
-        y = vae.encode([concatenated], device, end_=(end_image is not None and not fun_or_fl2v_model),tiled=tiled_vae)[0]
-        del concatenated
-
-        has_ref = False
-        if extra_latents is not None:
-            samples = extra_latents["samples"].squeeze(0)
-            y = torch.cat([samples, y], dim=1)
-            mask = torch.cat([torch.ones_like(mask[:, 0:samples.shape[1]]), mask], dim=1)
-            num_frames += samples.shape[1] * 4
-            has_ref = True
-        y[:, :1] *= start_latent_strength
-        y[:, -1:] *= end_latent_strength
-
-        # Calculate maximum sequence length
-        patches_per_frame = lat_h * lat_w // (PATCH_SIZE[1] * PATCH_SIZE[2])
-        frames_per_stride = (num_frames - 1) // 4 + (2 if end_image is not None and not fun_or_fl2v_model else 1)
-        max_seq_len = frames_per_stride * patches_per_frame
-
-        if add_cond_latents is not None:
-            add_cond_latents["ref_latent_neg"] = vae.encode(torch.zeros(1, 3, 1, H, W, device=device, dtype=vae.dtype), device)
-        
-        if force_offload:
-            vae.model.to(offload_device)
-            mm.soft_empty_cache()
-            gc.collect()
-        if output_path:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = os.path.join(output_path, f"{timestamp}_infinitetalk_output")
-            os.makedirs(output_path, exist_ok=True)
-        image_embeds = {
-            "image_embeds": y.cpu(),
-            "clip_context": clip_embeds.get("clip_embeds", None) if clip_embeds is not None else None,
-            "negative_clip_context": clip_embeds.get("negative_clip_embeds", None) if clip_embeds is not None else None,
-            "max_seq_len": max_seq_len,
-            "num_frames": num_frames,
-            "lat_h": lat_h,
-            "lat_w": lat_w,
-            "control_embeds": control_embeds["control_embeds"] if control_embeds is not None else None,
-            "end_image": resized_end_image if end_image is not None else None,
-            "fun_or_fl2v_model": fun_or_fl2v_model,
-            "has_ref": has_ref,
-            "add_cond_latents": add_cond_latents,
-            "mask": mask.cpu(),
-            "output_path": output_path
-        }
-
-        return (image_embeds,)
-        
-
 NODE_CLASS_MAPPINGS = {
     "InfiniteTalkMultiImage": InfiniteTalkMultiImage,
-    "WanVideoImageToVideoInfiniteTalkFunCamera": WanVideoImageToVideoInfiniteTalkFunCamera,
-    "WanVideoImageToVideoEncodeForInfiniteTalkFunCamera": WanVideoImageToVideoEncodeForInfiniteTalkFunCamera,
+    "InfiniteTalkEmbedsSlice": InfiniteTalkEmbedsSlice,
+    "VideoFromPathsAndAudio": VideoFromPathsAndAudio,
 
     "MakeBatchFromIntList": MakeBatchFromIntList,
     "GetIntByIndex": GetIntByIndex,
     "GetFloatByIndex": GetFloatByIndex,
     "MakeBatchFromFloatList": MakeBatchFromFloatList,
-    "InfiniteTalkEmbedsSlice": InfiniteTalkEmbedsSlice,
-    "AudioSmartSlice": AudioSmartSlice,
-
-    "VideoFromPathsAndAudio": VideoFromPathsAndAudio
 
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+
     "InfiniteTalkMultiImage": "InfiniteTalkMultiImage",
-    "WanVideoImageToVideoEncodeForInfiniteTalkFunCamera": "WanVideoImageToVideoEncodeForInfiniteTalkFunCamera",
+    "InfiniteTalkEmbedsSlice": "InfiniteTalkEmbedsSlice",
+    "VideoFromPathsAndAudio": "Video Synth (Path List + Audio)",
     "MakeBatchFromIntList": "MakeBatchFromIntList",
     "GetIntByIndex": "GetIntByIndex",
     "GetFloatByIndex": "GetFloatByIndex",
     "MakeBatchFromFloatList": "MakeBatchFromFloatList",
-    "InfiniteTalkEmbedsSlice": "InfiniteTalkEmbedsSlice",
-    "AudioSmartSlice": "AudioSmartSlice",
     
-    "VideoFromPathsAndAudio": "Video Synth (Path List + Audio)"
-
 }
